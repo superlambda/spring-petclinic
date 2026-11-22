@@ -10,7 +10,7 @@ RUN ./mvnw -B -Dmaven.test.skip=true package
 
 # Used by docker-compose.dev.yml
 FROM base AS development
-CMD ["./mvnw", "spring-boot:run", "-Dspring-boot.run.profiles=mysql", "-Dspring-boot.run.jvmArguments='-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:8000'"]
+CMD ["./mvnw", "spring-boot:run", "-Dspring-boot.run.profiles=mysql", "-Dspring-boot.run.jvmArguments=-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:8000"]
 
 FROM eclipse-temurin:17-jre-jammy AS production
 RUN groupadd --gid 10001 petclinic \
