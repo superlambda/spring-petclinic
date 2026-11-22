@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2019 the original author or authors.
+ * Copyright 2012-2025 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,8 @@ import org.springframework.samples.petclinic.model.BaseEntity;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Table;
-import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 
 /**
  * Simple JavaBean domain object representing a visit.
@@ -39,14 +40,15 @@ public class Visit extends BaseEntity {
 	@DateTimeFormat(pattern = "yyyy-MM-dd")
 	private LocalDate date;
 
-	@NotEmpty
+	@NotBlank
+	@Size(max = 255)
 	private String description;
 
 	/**
-	 * Creates a new instance of Visit for the current date
+	 * Creates a new instance of Visit for tomorrow
 	 */
 	public Visit() {
-		this.date = LocalDate.now();
+		this.date = LocalDate.now().plusDays(1);
 	}
 
 	public LocalDate getDate() {
