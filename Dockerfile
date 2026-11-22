@@ -1,22 +1,22 @@
-# syntax=docker/dockerfile:1
-
-FROM eclipse-temurin:17-jdk-jammy as base
+FROM eclipse-temurin:17-jdk-jammy AS base
 WORKDIR /app
 COPY .mvn/ .mvn
 COPY mvnw pom.xml ./
-RUN ./mvnw dependency:resolve
+RUN ./mvnw -B dependency:resolve
 COPY src ./src
 
-FROM base as test
-RUN ["./mvnw", "test"]
+FROM base AS build
+RUN ./mvnw -B -Dmaven.test.skip=true package
 
-FROM base as development
+# Used by docker-compose.dev.yml
+FROM base AS development
 CMD ["./mvnw", "spring-boot:run", "-Dspring-boot.run.profiles=mysql", "-Dspring-boot.run.jvmArguments='-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:8000'"]
 
-FROM base as build
-RUN ./mvnw package
-
-FROM eclipse-temurin:17-jre-jammy as production
+FROM eclipse-temurin:17-jre-jammy AS production
+RUN groupadd --gid 10001 petclinic \
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin petclinic
+WORKDIR /app
+COPY --from=build --chown=10001:10001 /app/target/spring-petclinic-*.jar /app/spring-petclinic.jar
+USER 10001:10001
 EXPOSE 8080
-COPY --from=build /app/target/spring-petclinic-*.jar /spring-petclinic.jar
-CMD ["java", "-Djava.security.egd=file:/dev/./urandom", "-jar", "/spring-petclinic.jar"]
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/spring-petclinic.jar"]

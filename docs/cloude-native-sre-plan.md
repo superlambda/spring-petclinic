@@ -55,8 +55,8 @@
 
 #### 2. 动手实践
 
-- [ ] 为现有项目编写 Dockerfile。
-- [ ] 构建 Docker Image，并在本地运行。
+- [x] 为现有项目编写 Dockerfile。
+- [x] 构建 Docker Image，并在本地运行。
 - [ ] 部署应用到本地 Kubernetes 集群。
 - [ ] 配置 Deployment 和多个 Replicas。
 - [ ] 通过 Kubernetes Service 暴露应用。
@@ -288,7 +288,7 @@
 
 四周结束时，争取完成以下成果：
 
-- [ ] Dockerfile 和容器化应用。
+- [x] Dockerfile 和容器化应用。
 - [ ] Kubernetes Deployment 和 Service 配置。
 - [ ] Health Check 和资源配置。
 - [ ] HPA 和自动扩缩容配置。
