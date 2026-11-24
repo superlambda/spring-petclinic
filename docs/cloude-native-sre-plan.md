@@ -58,10 +58,10 @@
 - [x] 为现有项目编写 Dockerfile。
 - [x] 构建 Docker Image，并在本地运行。
 - [x] 部署应用到本地 Kubernetes 集群。
-- [ ] 配置 Deployment 和多个 Replicas。
+- [x] 配置 Deployment 和多个 Replicas。
 - [x] 通过 Kubernetes Service 暴露应用。
 - [x] 配置 Readiness Probe 和 Liveness Probe。
-- [ ] 模拟 Pod 故障，观察 Kubernetes 如何自动恢复。
+- [x] 模拟 Pod 故障，观察 Kubernetes 如何自动恢复。
 
 #### 3. 阶段验收
 

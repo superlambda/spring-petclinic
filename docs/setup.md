@@ -1,6 +1,6 @@
 # 环境搭建记录
 
-本机 Cloud-native & SRE 学习环境索引。最后更新：2026-11-22。
+本机 Cloud-native & SRE 学习环境索引。最后更新：2026-11-24。
 
 ## 当前环境
 
@@ -91,6 +91,8 @@ kubectl config set-context --current --namespace=petclinic
 - `k8s/petclinic.yml`：`petclinic:dev` + `postgres` profile + 显式 `POSTGRES_*`（不使用 Service Binding）+ startupProbe `/livez` + 优雅关闭 + `/readyz` 含 `db`
 - Phase 1 验证通过：`/`、`/owners/1`、`/livez`、`/readyz`、`/actuator/health`
 - Phase 2 验证通过：优雅关闭日志、`/readyz` 含 `db`
+- Phase 3 验证通过：删 Pod 由 ReplicaSet 补齐；`kill 1` 容器原地重启、RESTARTS 加 1
+- Phase 4 验证通过：扩到 3 副本，EndpointSlice 有 3 个 endpoint；删 1 个后补齐，已恢复 `replicas: 1`
 - 手工查库用 `-U user`（没有 `postgres` 角色）
 
 ### 4.1 部署
@@ -225,6 +227,5 @@ kubectl rollout status -n petclinic deployment/petclinic --timeout=180s
 
 ## 6. 下一步
 
-1. Phase 3：跑 4.4 的自愈验证。
-2. Phase 4：跑 4.5 的扩容验证。
-3. 在 `docs/week-1-acceptance.md` 记录验收答案。
+1. Week 1 验收文档：`docs/week-1-acceptance.md`（已完成）。
+2. 进入 Week 2：resources/limits、HPA、RollingUpdate/rollback。
