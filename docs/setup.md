@@ -294,6 +294,42 @@ kubectl exec -n petclinic deployment/petclinic -- sh -c 'echo cpu.max=$(cat /sys
 
 注：`usage_usec` 等累计值受 Pod 启动和额外 `exec` 影响，比较只看 60 秒 delta。
 
+### 4.8 metrics-server（HPA 前置）
+
+- 版本：v0.9.1，本地清单 `k8s/metrics-server.yml`，来自官方 release 产物。
+- 网络：GitHub 和 Docker Hub 不可达；清单经 jsDelivr 获取，镜像从 `registry.k8s.io` 拉取。
+- 镜像：`registry.k8s.io/metrics-server/metrics-server:v0.9.1`。
+
+安装：
+
+```bash
+kubectl apply -f k8s/metrics-server.yml
+kubectl rollout status -n kube-system deployment/metrics-server --timeout=180s
+kubectl get pods -n kube-system -l k8s-app=metrics-server -o wide
+```
+
+- 本地集群必须加 `--kubelet-insecure-tls`：Docker Desktop 的 kubelet serving cert 没有 IP SAN，默认校验会报 `x509: ... doesn't contain any IP SANs`，readiness 返回 500。该参数关闭 metrics-server 到 kubelet 的证书校验，**仅限本地学习集群**；生产环境应使用受信任 CA 签发的 kubelet serving cert。
+- APIService 里的 `insecureSkipTLSVerify: true` 是官方默认值，作用于 API Server 到 metrics-server，和上面的 kubelet 参数不是一回事。
+
+验证：
+
+```bash
+kubectl get apiservices | grep metrics
+kubectl top nodes
+kubectl top pods -n petclinic
+```
+
+2026-11-25 结果：
+
+| 检查 | 结果 |
+|---|---|
+| APIService | `v1beta1.metrics.k8s.io` True |
+| Node | `desktop-control-plane` 175m / 1976Mi |
+| App Pod | `petclinic` 3m / 284Mi |
+| DB Pod | `demo-db` 2m / 129Mi |
+
+结论：metrics-server Ready，Metrics API 可用，HPA 的指标前置条件满足。
+
 ## 5. 测试
 
 ```bash
@@ -310,4 +346,5 @@ kubectl exec -n petclinic deployment/petclinic -- sh -c 'echo cpu.max=$(cat /sys
 
 1. Week 1 验收文档：`docs/week-1-acceptance.md`（已完成）。
 2. Week 2 资源配置：已完成并复测（见 4.6；CPU limit 2，轻负载无 throttling）。
-3. 下一步：安装 metrics-server，配置 HPA，做负载测试。
+3. metrics-server：已安装并验证（见 4.8）。
+4. 下一步：把 `SPRING_SQL_INIT_MODE=never` 写进 `k8s/petclinic.yml`，然后配置 HPA 并压测。
