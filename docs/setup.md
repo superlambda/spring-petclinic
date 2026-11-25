@@ -1,6 +1,6 @@
 # 环境搭建记录
 
-本机 Cloud-native & SRE 学习环境索引。最后更新：2026-11-24。
+本机 Cloud-native & SRE 学习环境索引。最后更新：2026-11-25。
 
 ## 当前环境
 
@@ -213,6 +213,87 @@ kubectl apply -n petclinic -f k8s/petclinic.yml
 kubectl rollout status -n petclinic deployment/petclinic --timeout=180s
 ```
 
+### 4.6 资源配置（Week 2）
+
+- App：requests `cpu=250m`、`memory=512Mi`；limits `cpu=2`、`memory=1Gi`；QoS `Burstable`。
+- 无 limit 时 JVM max heap 7.05 GiB；1Gi limit 后 `MaxHeapSize=805306368`（768 MiB）。
+- 测量基线：空闲 RSS 约 401 MiB，heap 85 MiB，non-heap 134 MiB；空闲 CPU 约 0.005 核。
+- 初始 `cpu=1`：JVM `system.cpu.count=1`，GC 从 G1 变为 Serial（`UseSerialGC=true`）；空闲无 throttling，轻负载出现 `nr_throttled +12`、`throttled_usec +0.966s`。
+- 调参后 `cpu=2`：JVM `system.cpu.count=2`，仍为 Serial GC；同样轻负载下 `nr_throttled` 与 `throttled_usec` 增量均为 0。
+- Actuator `jvm.memory.max?tag=area:heap` 为 742.5 MiB，是池 max 求和少算一个 survivor，不是堆上限。
+- live 仍有 `SPRING_SQL_INIT_MODE=never`，`k8s/petclinic.yml` 未声明；HPA 前补上。
+- `requests.cpu=250m` 仍是初始值；HPA 压测时根据实际利用率校准。
+- 1 核 → 2 核的对照数据和 JVM 视角见 4.7。
+- 下一步：安装 metrics-server、配置 HPA、做负载测试。
+
+### 4.7 测量与验证命令
+
+Actuator 查询前保持端口转发（终端 A）：
+
+```bash
+kubectl port-forward -n petclinic svc/petclinic 8080:80
+```
+
+配置前基线：
+
+```bash
+kubectl exec -n petclinic deployment/petclinic -- sh -c 'echo memory.current=$(cat /sys/fs/cgroup/memory.current); echo memory.peak=$(cat /sys/fs/cgroup/memory.peak); echo memory.max=$(cat /sys/fs/cgroup/memory.max); grep -E "VmRSS|VmHWM|Threads" /proc/1/status; cat /sys/fs/cgroup/cpu.stat'
+```
+
+```bash
+curl -s 'localhost:8080/actuator/metrics/jvm.memory.max'; echo
+curl -s 'localhost:8080/actuator/metrics/jvm.memory.used?tag=area:heap'; echo
+curl -s 'localhost:8080/actuator/metrics/jvm.memory.used?tag=area:nonheap'; echo
+curl -s 'localhost:8080/actuator/metrics/process.cpu.usage'; echo
+curl -s 'localhost:8080/actuator/metrics/system.cpu.count'; echo
+```
+
+配置后验证：
+
+```bash
+kubectl get pod -n petclinic -l app=petclinic -o jsonpath='{.items[0].spec.containers[0].resources}{"\n"}'
+kubectl get pod -n petclinic -l app=petclinic -o jsonpath='{.items[0].status.qosClass}{"\n"}'
+kubectl exec -n petclinic deployment/petclinic -- env | grep SPRING_SQL_INIT_MODE
+```
+
+```bash
+kubectl exec -n petclinic deployment/petclinic -- sh -c 'echo memory.max=$(cat /sys/fs/cgroup/memory.max); echo memory.current=$(cat /sys/fs/cgroup/memory.current); echo cpu.max=$(cat /sys/fs/cgroup/cpu.max); cat /sys/fs/cgroup/cpu.stat'
+kubectl exec -n petclinic deployment/petclinic -- java -XX:MaxRAMPercentage=75.0 -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E "MaxHeapSize|UseSerialGC|UseG1GC"
+```
+
+```bash
+curl -s 'localhost:8080/actuator/metrics/system.cpu.count'; echo
+curl -s 'localhost:8080/actuator/metrics/jvm.memory.max?tag=area:heap'; echo
+```
+
+本次结果：
+
+| 配置 | `cpu.max` | `system.cpu.count` | `MaxHeapSize` | GC |
+|---|---|---|---:|---|
+| `cpu=1` | `100000 100000` | 1.0 | 805306368 | Serial |
+| `cpu=2` | `200000 100000` | 2.0 | 805306368 | Serial |
+
+注意：`kubectl exec -- java` 不会 attach 到运行中的 Java 进程，而是在同一容器、同一 cgroup 里启动一个新的 JVM；它验证的是相同参数下的 ergonomics。运行中进程的启动参数用 `/proc/1/cmdline` 确认，运行指标用 Actuator。新 JVM 不继承 ENTRYPOINT 的 `-XX:MaxRAMPercentage=75.0`，所以验证 `MaxHeapSize` 时必须显式带上，否则得到默认 25% 的 256Mi。
+
+CPU throttling 60 秒增量：
+
+```bash
+kubectl exec -n petclinic deployment/petclinic -- sh -c 'echo cpu.max=$(cat /sys/fs/cgroup/cpu.max); echo before; grep -E "usage_usec|nr_periods|nr_throttled|throttled_usec" /sys/fs/cgroup/cpu.stat; sleep 60; echo after; grep -E "usage_usec|nr_periods|nr_throttled|throttled_usec" /sys/fs/cgroup/cpu.stat'
+```
+
+- 空闲测试：执行期间不做页面操作。
+- 轻负载测试：执行期间做同类页面操作。
+- 判断看 delta：`nr_throttled` 与 `throttled_usec` 的增量。
+
+本次结果（60 秒，页面操作）：
+
+| 配置 | CPU 使用 | `nr_periods` | `nr_throttled` | `throttled_usec` |
+|---|---:|---:|---:|---:|
+| `cpu=1` | +2.435s | +249 | +12 | +0.966s |
+| `cpu=2` | +2.725s | +229 | 0 | 0 |
+
+注：`usage_usec` 等累计值受 Pod 启动和额外 `exec` 影响，比较只看 60 秒 delta。
+
 ## 5. 测试
 
 ```bash
@@ -228,4 +309,5 @@ kubectl rollout status -n petclinic deployment/petclinic --timeout=180s
 ## 6. 下一步
 
 1. Week 1 验收文档：`docs/week-1-acceptance.md`（已完成）。
-2. 进入 Week 2：resources/limits、HPA、RollingUpdate/rollback。
+2. Week 2 资源配置：已完成并复测（见 4.6；CPU limit 2，轻负载无 throttling）。
+3. 下一步：安装 metrics-server，配置 HPA，做负载测试。
