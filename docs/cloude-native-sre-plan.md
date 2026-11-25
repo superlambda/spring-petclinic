@@ -114,8 +114,8 @@
 #### 2. 动手实践
 
 - [x] 配置 CPU 和 Memory Requests / Limits。
-- [ ] 配置 HPA，实现自动扩缩容。
-- [ ] 模拟流量增加，观察服务扩容行为。
+- [x] 配置 HPA，实现自动扩缩容。
+- [x] 模拟流量增加，观察服务扩容行为。
 - [ ] 执行 Rolling Update。
 - [ ] 测试应用版本回滚。
 - [ ] 使用 Resilience4j 实现 Circuit Breaker。
@@ -291,7 +291,7 @@
 - [x] Dockerfile 和容器化应用。
 - [x] Kubernetes Deployment 和 Service 配置。
 - [x] Health Check 和资源配置。
-- [ ] HPA 和自动扩缩容配置。
+- [x] HPA 和自动扩缩容配置。
 - [ ] Prometheus 监控配置。
 - [ ] Grafana Dashboard。
 - [ ] OpenTelemetry 链路追踪集成。

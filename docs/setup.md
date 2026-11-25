@@ -221,7 +221,7 @@ kubectl rollout status -n petclinic deployment/petclinic --timeout=180s
 - 初始 `cpu=1`：JVM `system.cpu.count=1`，GC 从 G1 变为 Serial（`UseSerialGC=true`）；空闲无 throttling，轻负载出现 `nr_throttled +12`、`throttled_usec +0.966s`。
 - 调参后 `cpu=2`：JVM `system.cpu.count=2`，仍为 Serial GC；同样轻负载下 `nr_throttled` 与 `throttled_usec` 增量均为 0。
 - Actuator `jvm.memory.max?tag=area:heap` 为 742.5 MiB，是池 max 求和少算一个 survivor，不是堆上限。
-- live 仍有 `SPRING_SQL_INIT_MODE=never`，`k8s/petclinic.yml` 未声明；HPA 前补上。
+- `SPRING_SQL_INIT_MODE=never` 已写入 `k8s/petclinic.yml`；live 原本已有，apply 后 Pod template 未变，没有触发重启。
 - `requests.cpu=250m` 仍是初始值；HPA 压测时根据实际利用率校准。
 - 1 核 → 2 核的对照数据和 JVM 视角见 4.7。
 - 下一步：安装 metrics-server、配置 HPA、做负载测试。
@@ -330,6 +330,67 @@ kubectl top pods -n petclinic
 
 结论：metrics-server Ready，Metrics API 可用，HPA 的指标前置条件满足。
 
+### 4.9 HPA 与负载测试
+
+HPA 配置（`k8s/hpa.yml`）：
+
+- `autoscaling/v2`，target Deployment `petclinic`
+- `minReplicas: 1`，`maxReplicas: 5`
+- CPU target 70%，相对 request 250m，即 175m
+
+应用与查看：
+
+```bash
+kubectl apply -n petclinic -f k8s/hpa.yml
+kubectl get hpa -n petclinic
+kubectl describe hpa -n petclinic petclinic
+```
+
+集群内 loadgen，打 Service 而不是 port-forward：
+
+```bash
+kubectl run loadgen --restart=Never -n petclinic \
+  --image=petclinic:dev \
+  --command -- bash -c '
+    WORKERS=50
+    DURATION=300
+    echo "loadgen start workers=$WORKERS duration=${DURATION}s"
+    for w in $(seq 1 "$WORKERS"); do
+      (
+        while true; do
+          exec 3<>/dev/tcp/petclinic/80 || continue
+          printf "GET /owners?lastName= HTTP/1.0\r\nHost: petclinic\r\n\r\n" >&3
+          cat <&3 >/dev/null
+          exec 3>&-
+        done
+      ) &
+    done
+    sleep "$DURATION"
+    kill $(jobs -p) 2>/dev/null
+    echo "loadgen done"
+  '
+```
+
+结果（2026-11-25）：
+
+| 阶段 | 观察 |
+|---|---|
+| 空闲 | 1 副本，`cpu: 1%/70%` |
+| 负载峰值 | 1 → 4 → 5 副本；5 副本时 `cpu: ~630%/70%`，`ScalingLimited TooManyReplicas` |
+| 单 Pod CPU | 约 1.4–1.7 核；内存 330–377Mi |
+| DB CPU | 负载时约 0.4 核 |
+| 负载结束 | CPU 回落到 1%，5 副本保持约 5 分钟（scale-down stabilization 300s），随后缩回 1 |
+| 缩容事件 | 仅 `Killing`，无 `Unhealthy`/`Failed`；watch 中的短暂 `Error` 是容器删除时的退出状态 |
+
+结论：
+
+- HPA 和 metrics-server 工作正常，扩容和缩容都按预期发生。
+- 5 副本仍停在 630%，说明 `maxReplicas: 5` 是这次负载的容量上限；HPA 不能突破 maxReplicas。
+- 利用率的分母是 request 250m；本次每 Pod 实际约 1.6 核，利用率约 640%，所以 HPA 很快打满。生产上需要按预期单 Pod 用量校准 request，并按节点容量设置 maxReplicas。
+- 负载打的是 Service，5 个 Pod 都收到流量；port-forward 只适合单 Pod 调试，不适合 HPA 验证。
+- 缩容的 `Error` 状态需要时再结合 Pod 日志确认 graceful shutdown；本次没有探针失败事件。
+- HPA 接管 `spec.replicas`；HPA 实验期间不要 apply `k8s/petclinic.yml`，否则 `replicas: 1` 会和 HPA 竞争。
+
 ## 5. 测试
 
 ```bash
@@ -347,4 +408,6 @@ kubectl top pods -n petclinic
 1. Week 1 验收文档：`docs/week-1-acceptance.md`（已完成）。
 2. Week 2 资源配置：已完成并复测（见 4.6；CPU limit 2，轻负载无 throttling）。
 3. metrics-server：已安装并验证（见 4.8）。
-4. 下一步：把 `SPRING_SQL_INIT_MODE=never` 写进 `k8s/petclinic.yml`，然后配置 HPA 并压测。
+4. SQL init 漂移：已消除（见 4.6）。
+5. HPA 与负载测试：已完成（见 4.9；1 → 5 → 1）。
+6. 下一步：RollingUpdate / rollback 实验。

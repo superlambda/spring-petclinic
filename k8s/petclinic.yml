@@ -59,6 +59,8 @@ spec:
                 {
                   "management.endpoint.health.probes.add-additional-paths": true
                 }
+            - name: SPRING_SQL_INIT_MODE
+              value: never
           resources:
             requests:
               cpu: 250m
