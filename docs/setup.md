@@ -1,6 +1,6 @@
 # 环境搭建记录
 
-本机 Cloud-native & SRE 学习环境索引。最后更新：2026-11-25。
+本机 Cloud-native & SRE 学习环境索引。最后更新：2026-11-26。
 
 ## 当前环境
 
@@ -12,7 +12,7 @@
 | Docker Desktop | 4.99.0，Engine 29.9.3，BuildKit |
 | Kubernetes | Docker Desktop，1 node，v1.36.4，context `docker-desktop` |
 | 命名空间 | `petclinic`（已设为当前 context 默认） |
-| 镜像 | `petclinic:dev`（2026-11-22 构建，非 root 10001） |
+| 镜像 | `petclinic:dev`（2026-11-22 构建）、`petclinic:v2`（2026-11-26 构建），非 root 10001 |
 
 ## 1. 仓库与 CLI
 
@@ -391,6 +391,66 @@ kubectl run loadgen --restart=Never -n petclinic \
 - 缩容的 `Error` 状态需要时再结合 Pod 日志确认 graceful shutdown；本次没有探针失败事件。
 - HPA 接管 `spec.replicas`；HPA 实验期间不要 apply `k8s/petclinic.yml`，否则 `replicas: 1` 会和 HPA 竞争。
 
+### 4.10 RollingUpdate 与 rollback
+
+发布实验前先删除 HPA，把 `spec.replicas` 冻结为 1；实验结束后从 `k8s/hpa.yml` 恢复。HPA 删除窗口内不要 apply `k8s/petclinic.yml`，清单里的 `replicas: 1` 会和自动扩缩容竞争。
+
+```bash
+kubectl delete hpa -n petclinic petclinic
+kubectl get deployment -n petclinic petclinic -o jsonpath='{.spec.replicas}{"\n"}'
+
+docker build --pull=false --target production -t petclinic:v2 .
+
+kubectl annotate deployment -n petclinic petclinic kubernetes.io/change-cause="rollout petclinic:v2" --overwrite
+kubectl set image -n petclinic deployment/petclinic workload=petclinic:v2
+kubectl rollout status -n petclinic deployment/petclinic --timeout=180s
+
+kubectl annotate deployment -n petclinic petclinic kubernetes.io/change-cause="rollback to petclinic:dev" --overwrite
+kubectl rollout undo -n petclinic deployment/petclinic
+kubectl rollout status -n petclinic deployment/petclinic --timeout=180s
+
+kubectl apply -n petclinic -f k8s/hpa.yml
+```
+
+本次结果（2026-11-26）：
+
+| 阶段 | revision | 活跃镜像 | ReplicaSet |
+|---|---:|---|---|
+| 发布前 | 5 | `petclinic:dev` | `petclinic-6654bffdbd` 1 |
+| 发布 v2 | 6 | `petclinic:v2` | `petclinic-67fb8bbdb7` 0→1；`6654bffdbd` 1→0 |
+| 回滚 | 7 | `petclinic:dev` | `6654bffdbd` 0→1；`67fb8bbdb7` 1→0 |
+
+Pod 时序与优雅关闭：
+
+- 新 Pod `Pending → ContainerCreating → Running 0/1 → 1/1` 约 6 秒；旧 Pod 在新 Pod Ready 前保持 `1/1 Running`，之后进入 `Terminating`。
+- 1 副本时默认 `maxSurge=25% → 1`、`maxUnavailable=25% → 0`，发布期间短暂存在 2 个 Pod，可用副本不减少。
+- 旧 Pod 日志：
+
+```text
+Commencing graceful shutdown. Waiting for active requests to complete
+Graceful shutdown complete
+```
+
+- 两次被替换的 Pod 在 watch 中都短暂显示 `0/1 Error`。这是 JVM 收到 SIGTERM 后以 143 退出的常见表现，不是崩溃；事件只有 Normal 的 `Killing` 和 `SuccessfulDelete`，RESTARTS 始终为 0。判断优雅关闭应看应用日志，而不是 Pod phase。
+
+镜像与构建：
+
+- `docker build --pull=false --target production -t petclinic:v2 .` 全缓存命中，0.2 秒完成。
+- `petclinic:v2` 的 image ID 是包含 attestation 的 manifest list digest，与 `petclinic:dev` 不同；滚动更新由 Pod template 的 image 字符串变化触发，与 digest 是否相同无关。
+- 回滚后 Pod 镜像回到 `petclinic:dev`，revision 编号继续增加到 7，不回退。
+
+HPA 恢复：
+
+- 刚 apply 时 `TARGETS` 显示 `<unknown>`、`REPLICAS` 显示 0，是初始同步的瞬时状态；十几秒后稳定为 1 副本、`cpu: 2%/70%`，`AbleToScale` 与 `ScalingActive` 均为 True。
+
+本次踩到的三个点：
+
+1. `kubectl rollout undo` 提示 Deployment 之前由 `kubectl apply` 管理，回滚不会更新 last-applied-configuration annotation。imperative rollback 和 declarative apply 存在漂移风险；生产应以 Git revert 或 GitOps 回滚为准。
+2. `rollout history` 的 `CHANGE-CAUSE` 不可靠。回滚后 revision 7（当前 dev 模板）显示 `rollout petclinic:v2`，revision 6（v2 模板）显示 `rollback to petclinic:dev`，标签与模板错位。该 annotation 会在 Deployment 和 ReplicaSet 之间复制，不能当发布审计记录；发布身份应使用 Git commit、CI build number 或 image digest。
+3. HPA 删除窗口内不要 apply `k8s/petclinic.yml`；先用 `kubectl set image` 这类只改 template 的操作完成发布实验，最后再恢复 HPA。
+
+结论：单副本配置下滚动更新仍能保持可用副本不减少；新版本不就绪时 Deployment 会停在旧 ReplicaSet，`rollout undo` 可快速恢复。本次没有持续流量，未量化发布期间的错误率；单节点环境也无法验证节点级重调度。
+
 ## 5. 测试
 
 ```bash
@@ -410,4 +470,5 @@ kubectl run loadgen --restart=Never -n petclinic \
 3. metrics-server：已安装并验证（见 4.8）。
 4. SQL init 漂移：已消除（见 4.6）。
 5. HPA 与负载测试：已完成（见 4.9；1 → 5 → 1）。
-6. 下一步：RollingUpdate / rollback 实验。
+6. RollingUpdate / rollback：已完成（见 4.10；revision 5 → 6 → 7，镜像 dev → v2 → dev）。
+7. 下一步：Resilience4j 弹性模式（circuit breaker、timeout/retry/jitter、bulkhead、rate limiting、graceful degradation）。

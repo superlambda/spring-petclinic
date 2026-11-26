@@ -116,8 +116,8 @@
 - [x] 配置 CPU 和 Memory Requests / Limits。
 - [x] 配置 HPA，实现自动扩缩容。
 - [x] 模拟流量增加，观察服务扩容行为。
-- [ ] 执行 Rolling Update。
-- [ ] 测试应用版本回滚。
+- [x] 执行 Rolling Update。
+- [x] 测试应用版本回滚。
 - [ ] 使用 Resilience4j 实现 Circuit Breaker。
 - [ ] 模拟下游服务故障。
 - [ ] 验证故障是否会在服务之间级联传播。
