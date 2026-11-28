@@ -518,11 +518,47 @@ SUCCESS ×2
 注意：
 
 - `failureRate` 在达到 `minimum-number-of-calls` 之前显示 `-1.0%`，不是故障。
-- `slow`（200，2s）不会触发熔断：当前只按异常统计失败率。下一步用 `TimeLimiter` 或 HTTP 超时把慢调用纳入判定。
+- `slow`（200，2s）不会触发熔断：当前只按异常统计失败率。已在 4.12 用 HTTP 客户端超时把超时纳入失败判定；慢调用统计留到下一阶段。
 - 熔断状态是进程内的，每个 Pod 一套；实验期间暂停 HPA，保持 1 副本。
 - 本次“OPEN 下 `mode=ok` 快速失败”的验证实际发生在自动转 HALF_OPEN 之后，所以那两次调用正常打到了下游（17ms/8ms）；OPEN 短路已由 `notPermittedCalls=3` 和 `CallNotPermittedException` 证明。若要在 OPEN 窗口内观察 `mode=ok` 快速失败，需要在打开后 10 秒内立即发起调用。
 
-当前状态：主应用 `petclinic:v4`（revision 8）1 副本，下游 `petclinic:v3` 1 副本；HPA 仍暂停，Resilience4j 阶段结束后恢复。
+当前状态：主应用 `petclinic:v5`（revision 9）1 副本，下游 `petclinic:v3` 1 副本；HPA 仍暂停，Resilience4j 阶段结束后恢复。
+
+### 4.12 Resilience4j：Timeout（客户端超时）
+
+目标：把“慢”纳入可判定的失败。此前 `RestClient.create()` 没有连接/读取超时，`mode=slow` 的 2 秒调用被记为 SUCCESS，`slowCalls=0`，熔断器对“慢”完全失明。
+
+实现（镜像 `petclinic:v5`，revision 9）：
+
+- `DownstreamClient` 改用 `JdkClientHttpRequestFactory`：connect 500ms、read 1s；两个值通过 `demo.downstream.connect-timeout-ms` / `demo.downstream.read-timeout-ms` 配置，便于下一阶段覆盖。
+- `/demo/call` 增加 `delayMs` 参数（默认 2000）并透传给下游；`fallback` 增加 `cause` 字段。
+- `application.properties` 增加上述两个超时项；`k8s/petclinic.yml` 镜像更新为 `petclinic:v5`。
+- 没有引入 `TimeLimiter`：它要求异步/`CompletableFuture` 返回类型，而同步 `RestClient` 的读超时已经能表达 deadline；需要异步时再引入。
+
+实验（2026-11-28）：
+
+| 阶段 | 结果 |
+|---|---|
+| v4 基线 | `mode=slow` 3 次均 200、约 2.01s；事件 SUCCESS 的 `durationInMs` 2006–2008；`slowCalls=0`、`slowCallRate=-1.0%`、CLOSED |
+| v5 冒烟 | `ok` 首次 71ms（含连接建立），后续约 10ms；`slow&delayMs=500` 200、520ms；`bufferedCalls=2`、`failedCalls=0`、CLOSED |
+| 单次 2s slow | HTTP 200、1.024s；fallback `error=ResourceAccessException`、`cause=HttpTimeoutException`；事件 ERROR `durationInMs=1010`；`bufferedCalls=3`、`failedCalls=1`、`failureRate=-1.0%`、`slowCalls=0`、CLOSED |
+| 第 4 次 buffered（slow#1） | 1.015s；窗口 4 次、失败率 50%，但 `minimum-number-of-calls=5` 未满足，仍 CLOSED |
+| 第 5 次 buffered（slow#2） | 1.017s；失败率 60% ≥ 50%，`FAILURE_RATE_EXCEEDED` + `CLOSED → OPEN`；fallback 中 `circuit=OPEN` |
+| OPEN 内 `ok` | 6ms；fallback `error=CallNotPermittedException`、`cause=none`、`circuit=OPEN`；`notPermittedCalls=1` |
+
+OPEN 时指标：`bufferedCalls=5`、`failedCalls=3`、`failureRate=60.0%`、`notPermittedCalls=1`、`slowCalls=0`、`slowCallRate=0.0%`。
+
+10 秒后自动转 `HALF_OPEN`，同时滑动窗口与 `notPermittedCalls` 重置为 0（观察到 `bufferedCalls=0`、`failedCalls=0`、`notPermittedCalls=0`）。HALF_OPEN 下连续 3 次 `ok`（12.8ms / 7.4ms / 6.2ms）全部成功，事件 `SUCCESS ×3` 后触发 `HALF_OPEN → CLOSED`；转 CLOSED 时窗口再次重置，最终 `bufferedCalls=0`、`failedCalls=0`、`state=CLOSED`。
+
+关键结论：
+
+- 超时是失败，不是慢调用：`slowCalls` 仍为 0。slow-call 需要 `slow-call-duration-threshold` 和 `slow-call-rate-threshold` 单独配置。
+- fallback 返回 HTTP 200 + `status=degraded`；失败判定要看响应体和熔断指标，不能只看 HTTP 状态码。
+- 超时只保护调用方线程，不取消下游工作：下游仍会把 2 秒 `sleep` 执行完；HTTP/1.1 没有取消语义。
+- 事件 message 是 `Request cancelled`，真正的类型在 cause：读超时为 `HttpTimeoutException`，连接被拒为 `ConnectException`，下游 503 为 `HttpServerErrorException`。
+- `minimum-number-of-calls=5` 是样本量闸门：4 次时 50% 不打开，5 次时 60% 才打开。
+- OPEN 内的 `ok` 在进入 `DownstreamClient.call` 之前被拒绝，6ms 返回；这就是熔断器对上游线程池的保护。
+- 下一步：进入 slow-call 统计（read timeout 3s、slow-call threshold 1s、rate 50%），验证“成功但慢”的调用会触发 OPEN。
 
 ## 5. 测试
 
@@ -545,4 +581,5 @@ SUCCESS ×2
 5. HPA 与负载测试：已完成（见 4.9；1 → 5 → 1）。
 6. RollingUpdate / rollback：已完成（见 4.10；revision 5 → 6 → 7，镜像 dev → v2 → dev）。
 7. Resilience4j Circuit Breaker：已完成（见 4.11；CLOSED → OPEN → HALF_OPEN → CLOSED）。
-8. 下一步：Timeout/TimeLimiter、Retry + jitter、Bulkhead、Rate Limiting、级联故障验证；全部完成后恢复 HPA。
+8. Resilience4j Timeout（客户端 connect/read 超时）：已完成（见 4.12；2s slow → 1s 超时 → CLOSED → OPEN）。
+9. 下一步：slow-call 统计、Retry + jitter、Bulkhead、Rate Limiting、级联故障验证；全部完成后恢复 HPA。

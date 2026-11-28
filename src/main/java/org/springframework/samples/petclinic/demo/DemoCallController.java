@@ -37,8 +37,9 @@ class DemoCallController {
 	}
 
 	@GetMapping
-	Map<String, Object> call(@RequestParam(defaultValue = "ok") String mode) {
-		return this.downstreamClient.call(mode);
+	Map<String, Object> call(@RequestParam(defaultValue = "ok") String mode,
+			@RequestParam(defaultValue = "2000") long delayMs) {
+		return this.downstreamClient.call(mode, delayMs);
 	}
 
 }
