@@ -522,7 +522,7 @@ SUCCESS ×2
 - 熔断状态是进程内的，每个 Pod 一套；实验期间暂停 HPA，保持 1 副本。
 - 本次“OPEN 下 `mode=ok` 快速失败”的验证实际发生在自动转 HALF_OPEN 之后，所以那两次调用正常打到了下游（17ms/8ms）；OPEN 短路已由 `notPermittedCalls=3` 和 `CallNotPermittedException` 证明。若要在 OPEN 窗口内观察 `mode=ok` 快速失败，需要在打开后 10 秒内立即发起调用。
 
-当前状态：主应用 `petclinic:v5`（revision 9）1 副本，下游 `petclinic:v3` 1 副本；HPA 仍暂停，Resilience4j 阶段结束后恢复。
+当前状态：主应用 `petclinic:v6`（revision 10）1 副本，下游 `petclinic:v3` 1 副本；HPA 仍暂停，Resilience4j 阶段结束后恢复。
 
 ### 4.12 Resilience4j：Timeout（客户端超时）
 
@@ -558,7 +558,48 @@ OPEN 时指标：`bufferedCalls=5`、`failedCalls=3`、`failureRate=60.0%`、`no
 - 事件 message 是 `Request cancelled`，真正的类型在 cause：读超时为 `HttpTimeoutException`，连接被拒为 `ConnectException`，下游 503 为 `HttpServerErrorException`。
 - `minimum-number-of-calls=5` 是样本量闸门：4 次时 50% 不打开，5 次时 60% 才打开。
 - OPEN 内的 `ok` 在进入 `DownstreamClient.call` 之前被拒绝，6ms 返回；这就是熔断器对上游线程池的保护。
-- 下一步：进入 slow-call 统计（read timeout 3s、slow-call threshold 1s、rate 50%），验证“成功但慢”的调用会触发 OPEN。
+- slow-call 统计见 4.13：read timeout 3s、slow-call threshold 1s、rate 50%，验证“成功但慢”的调用会触发 OPEN。
+
+### 4.13 Resilience4j：slow-call 统计
+
+目标：把“成功但很慢”的调用纳入熔断判定。4.12 的超时把 2 秒调用变成失败；这一节把 read timeout 放宽到 3 秒，让同样的 2 秒调用成功返回，再用 `slow-call-duration-threshold=1s` 把它标记为慢调用，用 `slow-call-rate-threshold=50` 在慢调用比例过高时打开熔断器。
+
+配置（镜像 `petclinic:v6`，revision 10）：
+
+- `application.properties`：`slow-call-duration-threshold=1s`、`slow-call-rate-threshold=50`。
+- `k8s/petclinic.yml`：`DEMO_DOWNSTREAM_READ_TIMEOUT_MS=3000`，让 2 秒响应在 read timeout 内成功返回；镜像更新为 `petclinic:v6`。
+- 其余熔断参数不变：COUNT_BASED 10、minimum 5、failure rate 50%、open 10s、half-open 3。
+
+冒烟（2026-11-28）：
+
+| 检查 | 结果 |
+|---|---|
+| 部署 | `petclinic:v6`（revision 10），Pod `petclinic-778879bf96-h5q84`，1/1，0 重启 |
+| 配置绑定 | `slowCallRateThreshold=50.0%`；env `DEMO_DOWNSTREAM_READ_TIMEOUT_MS=3000` |
+| 单次 2s slow | HTTP 200、2.081s、返回下游 JSON；`bufferedCalls=1`、`failedCalls=0`、`slowCalls=1`、`slowCallRate=-1.0%`、CLOSED |
+
+注：apply 后第一次 `curl` 出现 `Empty reply from server`，是 Pod 替换后端口转发短暂失效；重试即恢复。
+
+触发 OPEN（2026-11-28）：
+
+| 调用 | 结果 |
+|---|---|
+| `slow#2`–`slow#5` | 200、2.015s / 2.016s / 2.015s / 2.020s，均返回下游 JSON |
+| 事件 | `SUCCESS` ×5，`durationInMs` 2058 / 2005 / 2008 / 2006 / 2005；随后 `SLOW_CALL_RATE_EXCEEDED`、`CLOSED → OPEN` |
+| OPEN 内 `ok` | 7ms；fallback `error=CallNotPermittedException`、`cause=none`、`circuit=OPEN` |
+
+OPEN 时指标：`bufferedCalls=5`、`failedCalls=0`、`failureRate=0.0%`、`slowCalls=5`、`slowCallRate=100.0%`、`slowFailedCalls=0`、`notPermittedCalls=1`、`state=OPEN`。
+
+恢复：10 秒后 `OPEN → HALF_OPEN`，窗口与 `notPermittedCalls` 重置为 0；3 次 `ok`（14.9ms / 8.2ms / 7.2ms）全部成功，`SUCCESS ×3` 后 `HALF_OPEN → CLOSED`，最终 `bufferedCalls=0`、`failedCalls=0`、`slowCalls=0`、`state=CLOSED`。
+
+关键结论：
+
+- 熔断器有两条独立的判定线：`failureRate` 和 `slowCallRate`，任意一条超过阈值就打开。本节 `failureRate=0.0%`、`slowCallRate=100.0%`，打开完全由“慢”触发。
+- 慢调用是成功调用，不是异常：事件类型仍是 `SUCCESS`，`slowFailedCalls=0`，只是 `durationInMs` 超过 1 秒被计入 `slowCalls`。
+- `minimum-number-of-calls=5` 同样约束慢调用率：前 4 次即使全慢也不打开，第 5 次 100% ≥ 50% 才触发。
+- read timeout 与 slow-call 阈值要配套：timeout 必须大于可接受的慢调用耗时（这里 3s > 2s），slow-call 阈值应低于 timeout（这里 1s < 3s）；否则慢调用要么先被超时变成失败，要么永远达不到慢调用线。
+- 3 秒 read timeout 是本实验的环境覆盖；实验结束后是否保留，要结合下游 p99 和 SLO 再定。
+- fallback 仍返回 HTTP 200；判断降级要看响应体和熔断指标。
 
 ## 5. 测试
 
@@ -582,4 +623,5 @@ OPEN 时指标：`bufferedCalls=5`、`failedCalls=3`、`failureRate=60.0%`、`no
 6. RollingUpdate / rollback：已完成（见 4.10；revision 5 → 6 → 7，镜像 dev → v2 → dev）。
 7. Resilience4j Circuit Breaker：已完成（见 4.11；CLOSED → OPEN → HALF_OPEN → CLOSED）。
 8. Resilience4j Timeout（客户端 connect/read 超时）：已完成（见 4.12；2s slow → 1s 超时 → CLOSED → OPEN）。
-9. 下一步：slow-call 统计、Retry + jitter、Bulkhead、Rate Limiting、级联故障验证；全部完成后恢复 HPA。
+9. Resilience4j slow-call 统计：已完成（见 4.13；5 次 2s 成功慢调用 → slowCallRate 100% → OPEN）。
+10. 下一步：Retry + jitter、Bulkhead、Rate Limiting、级联故障验证；全部完成后恢复 HPA。

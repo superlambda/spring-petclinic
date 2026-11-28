@@ -31,7 +31,7 @@ spec:
       terminationGracePeriodSeconds: 40
       containers:
         - name: workload
-          image: petclinic:v5
+          image: petclinic:v6
           imagePullPolicy: IfNotPresent
           env:
             - name: SPRING_PROFILES_ACTIVE
@@ -65,6 +65,9 @@ spec:
               value: petclinic-downstream
             - name: DEMO_DOWNSTREAM_PORT
               value: "80"
+            # slow-call 实验：允许 2s 的成功响应，见 docs/setup.md 4.13
+            - name: DEMO_DOWNSTREAM_READ_TIMEOUT_MS
+              value: "3000"
           resources:
             requests:
               cpu: 250m
