@@ -31,7 +31,7 @@ spec:
       terminationGracePeriodSeconds: 40
       containers:
         - name: workload
-          image: petclinic:dev
+          image: petclinic:v4
           imagePullPolicy: IfNotPresent
           env:
             - name: SPRING_PROFILES_ACTIVE
@@ -61,6 +61,10 @@ spec:
                 }
             - name: SPRING_SQL_INIT_MODE
               value: never
+            - name: DEMO_DOWNSTREAM_HOST
+              value: petclinic-downstream
+            - name: DEMO_DOWNSTREAM_PORT
+              value: "80"
           resources:
             requests:
               cpu: 250m

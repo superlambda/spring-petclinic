@@ -12,7 +12,7 @@
 | Docker Desktop | 4.99.0，Engine 29.9.3，BuildKit |
 | Kubernetes | Docker Desktop，1 node，v1.36.4，context `docker-desktop` |
 | 命名空间 | `petclinic`（已设为当前 context 默认） |
-| 镜像 | `petclinic:dev`（2026-11-22 构建）、`petclinic:v2`（2026-11-26 构建），非 root 10001 |
+| 镜像 | `petclinic:dev`、`petclinic:v2`、`petclinic:v3`（下游 harness）、`petclinic:v4`（Resilience4j 客户端），非 root 10001 |
 
 ## 1. 仓库与 CLI
 
@@ -451,6 +451,79 @@ HPA 恢复：
 
 结论：单副本配置下滚动更新仍能保持可用副本不减少；新版本不就绪时 Deployment 会停在旧 ReplicaSet，`rollout undo` 可快速恢复。本次没有持续流量，未量化发布期间的错误率；单节点环境也无法验证节点级重调度。
 
+### 4.11 Resilience4j：下游 harness 与 Circuit Breaker
+
+目标：PetClinic 本身没有出站调用，先用同一镜像部署一个可控下游，再用真实网络故障验证熔断状态机，而不是进程内 mock。
+
+组件：
+
+- `k8s/downstream.yml`：`petclinic-downstream` Deployment/Service，镜像 `petclinic:v3`，暴露 `/demo/downstream?mode=ok|slow|error`；`slow` 延迟 `delayMs` 后返回 200，`error` 返回 503。
+- `DownstreamClient`：`RestClient` 调用下游，`@CircuitBreaker(name="downstream", fallbackMethod="fallback")`；fallback 返回 `status=degraded` 和当前熔断状态。
+- `DemoCallController`：`/demo/call?mode=...` 触发受保护调用。
+- 主应用镜像 `petclinic:v4`，`k8s/petclinic.yml` 注入 `DEMO_DOWNSTREAM_HOST=petclinic-downstream`、`DEMO_DOWNSTREAM_PORT=80`。
+- `application.properties` 暴露 `/actuator/circuitbreakers` 和 `/actuator/circuitbreakerevents/downstream`。
+
+熔断配置：
+
+| 参数 | 值 |
+|---|---|
+| `sliding-window-type` | `COUNT_BASED` |
+| `sliding-window-size` | 10 |
+| `minimum-number-of-calls` | 5 |
+| `failure-rate-threshold` | 50% |
+| `wait-duration-in-open-state` | 10s |
+| `permitted-number-of-calls-in-half-open-state` | 3 |
+| `automatic-transition-from-open-to-half-open-enabled` | true |
+
+关键命令：
+
+```bash
+kubectl delete hpa -n petclinic petclinic
+kubectl apply -n petclinic -f k8s/downstream.yml
+kubectl apply -n petclinic -f k8s/petclinic.yml
+
+curl -sS 'localhost:8080/demo/call?mode=ok'
+for i in 1 2 3 4 5 6; do curl -sS 'localhost:8080/demo/call?mode=error'; echo; done
+curl -sS 'localhost:8080/actuator/circuitbreakers'
+curl -sS 'localhost:8080/actuator/circuitbreakerevents/downstream'
+```
+
+状态机实验（2026-11-26）：
+
+| 阶段 | 观察 |
+|---|---|
+| 正常调用 | `mode=ok` 返回下游 JSON；`state=CLOSED` |
+| 单次失败 | fallback `ServiceUnavailable`，`state=CLOSED`；`failureRate=-1.0%`，因为未达到最少 5 次调用 |
+| 连续失败 | 第 5 次 buffered 调用时失败率 80% ≥ 50%，触发 `CLOSED → OPEN`；后续 3 次调用 `NOT_PERMITTED` |
+| OPEN 指标 | `bufferedCalls=5`、`failedCalls=4`、`failureRate=80.0%`、`notPermittedCalls=3` |
+| OPEN 期间 | `CallNotPermittedException`，fallback 立即返回，不再访问下游 |
+| 自动转半开 | OPEN 后 10s，`OPEN → HALF_OPEN` |
+| HALF_OPEN 探针 | 放行 3 次；前 2 次 `mode=ok` 成功，第 3 次成功后 `HALF_OPEN → CLOSED` |
+| 最终 | `CLOSED`，窗口重置后 `bufferedCalls=2`、`failedCalls=0` |
+
+事件序列（节选）：
+
+```text
+SUCCESS
+ERROR (503 ServiceUnavailable) ×4
+FAILURE_RATE_EXCEEDED
+STATE_TRANSITION CLOSED -> OPEN
+NOT_PERMITTED ×3
+STATE_TRANSITION OPEN -> HALF_OPEN
+SUCCESS ×2
+SUCCESS + STATE_TRANSITION HALF_OPEN -> CLOSED
+SUCCESS ×2
+```
+
+注意：
+
+- `failureRate` 在达到 `minimum-number-of-calls` 之前显示 `-1.0%`，不是故障。
+- `slow`（200，2s）不会触发熔断：当前只按异常统计失败率。下一步用 `TimeLimiter` 或 HTTP 超时把慢调用纳入判定。
+- 熔断状态是进程内的，每个 Pod 一套；实验期间暂停 HPA，保持 1 副本。
+- 本次“OPEN 下 `mode=ok` 快速失败”的验证实际发生在自动转 HALF_OPEN 之后，所以那两次调用正常打到了下游（17ms/8ms）；OPEN 短路已由 `notPermittedCalls=3` 和 `CallNotPermittedException` 证明。若要在 OPEN 窗口内观察 `mode=ok` 快速失败，需要在打开后 10 秒内立即发起调用。
+
+当前状态：主应用 `petclinic:v4`（revision 8）1 副本，下游 `petclinic:v3` 1 副本；HPA 仍暂停，Resilience4j 阶段结束后恢复。
+
 ## 5. 测试
 
 ```bash
@@ -471,4 +544,5 @@ HPA 恢复：
 4. SQL init 漂移：已消除（见 4.6）。
 5. HPA 与负载测试：已完成（见 4.9；1 → 5 → 1）。
 6. RollingUpdate / rollback：已完成（见 4.10；revision 5 → 6 → 7，镜像 dev → v2 → dev）。
-7. 下一步：Resilience4j 弹性模式（circuit breaker、timeout/retry/jitter、bulkhead、rate limiting、graceful degradation）。
+7. Resilience4j Circuit Breaker：已完成（见 4.11；CLOSED → OPEN → HALF_OPEN → CLOSED）。
+8. 下一步：Timeout/TimeLimiter、Retry + jitter、Bulkhead、Rate Limiting、级联故障验证；全部完成后恢复 HPA。
